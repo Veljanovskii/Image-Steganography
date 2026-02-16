@@ -1,0 +1,8 @@
+torch
+torchvision
+torchaudio
+tqdm
+pillow
+opencv-python
+matplotlib
+gdown
