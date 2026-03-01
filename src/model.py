@@ -33,7 +33,6 @@ class Down(nn.Module):
 class Up(nn.Module):
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
-        # in_ch = channels after concat(skip + upsampled)
         self.block = ConvBlock(in_ch, out_ch)
 
     def forward(self, x, skip):
@@ -42,16 +41,18 @@ class Up(nn.Module):
         return self.block(x)
 
 
-class UNetEncoder(nn.Module):
+class UNetEncoderResidual(nn.Module):
     """
-    Takes cover+secret (6ch) -> produces stego (3ch).
+    Predicts residual delta (3ch). Stego is formed as:
+      stego = clamp(cover + eps * tanh(delta), 0..1)
+    This strongly preserves cover image => higher PSNR(stego, cover).
     """
     def __init__(self, base: int = 32):
         super().__init__()
-        self.d1 = Down(6, base)           # 256 -> 128
-        self.d2 = Down(base, base * 2)    # 128 -> 64
-        self.d3 = Down(base * 2, base * 4)# 64 -> 32
-        self.d4 = Down(base * 4, base * 8)# 32 -> 16
+        self.d1 = Down(6, base)
+        self.d2 = Down(base, base * 2)
+        self.d3 = Down(base * 2, base * 4)
+        self.d4 = Down(base * 4, base * 8)
 
         self.bottleneck = ConvBlock(base * 8, base * 16)
 
@@ -60,7 +61,7 @@ class UNetEncoder(nn.Module):
         self.u2 = Up(base * 4 + base * 2, base * 2)
         self.u1 = Up(base * 2 + base, base)
 
-        self.out = nn.Conv2d(base, 3, 1)
+        self.out_delta = nn.Conv2d(base, 3, 1)
 
     def forward(self, cover, secret):
         x = torch.cat([cover, secret], dim=1)  # (B,6,H,W)
@@ -77,15 +78,11 @@ class UNetEncoder(nn.Module):
         x = self.u2(x, s2)
         x = self.u1(x, s1)
 
-        stego = torch.sigmoid(self.out(x))  # keep in [0,1]
-        return stego
+        delta = self.out_delta(x)  # unbounded residual
+        return delta
 
 
 class Decoder(nn.Module):
-    """
-    Takes stego (3ch) -> recovers secret (3ch).
-    Simple CNN (can be upgraded to U-Net too, but this is stable and works well).
-    """
     def __init__(self, base: int = 32):
         super().__init__()
         self.net = nn.Sequential(
@@ -105,17 +102,25 @@ class Decoder(nn.Module):
         )
 
     def forward(self, stego):
-        secret_hat = torch.sigmoid(self.net(stego))
-        return secret_hat
+        return torch.sigmoid(self.net(stego))
 
 
 class StegoNet(nn.Module):
-    def __init__(self, base: int = 32):
+    def __init__(self, base: int = 32, eps: float = 0.03):
+        """
+        eps controls maximum per-pixel perturbation (in [0,1] space).
+        Smaller eps => higher PSNR(stego,cover) but harder to recover secret.
+        Good starting values:
+          eps=0.03 -> typically PSNR > ~35 dB
+          eps=0.05 -> easier recovery but PSNR may drop
+        """
         super().__init__()
-        self.encoder = UNetEncoder(base=base)
+        self.encoder = UNetEncoderResidual(base=base)
         self.decoder = Decoder(base=base)
+        self.eps = eps
 
     def forward(self, cover, secret):
-        stego = self.encoder(cover, secret)
+        delta = self.encoder(cover, secret)
+        stego = torch.clamp(cover + self.eps * torch.tanh(delta), 0.0, 1.0)
         recovered = self.decoder(stego)
         return stego, recovered
